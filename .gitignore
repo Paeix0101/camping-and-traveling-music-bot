@@ -1,0 +1,40 @@
+# Secrets
+.env
+.env.local
+.env.*
+secrets.ini
+config.ini
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+pyvenv.cfg
+
+# Virtual environments
+venv/
+env/
+ENV/
+virtualenv/
+
+# Downloads
+downloads/
+*.mp3
+*.webm
+*.m4a
+*.opus
+
+# System
+.DS_Store
+Thumbs.db
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
