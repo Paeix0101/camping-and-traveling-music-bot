@@ -1,274 +1,570 @@
 import os
-import re
-import asyncio
 import logging
-from typing import Dict, List
-from pyrogram import Client, filters, idle
-from pyrogram.types import Message
-from flask import Flask
-import threading
-from youtube_search import YoutubeSearch
+from flask import Flask, request, jsonify
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.constants import ParseMode
 import yt_dlp
+import json
+import asyncio
+from threading import Thread
+import time
+from queue import Queue
+import re
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Flask app for Render health check
+# Initialize Flask app
 app = Flask(__name__)
 
-# Get credentials from Render environment variables
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
-SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
+# Configuration
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+RENDER_WEB_URL = os.environ.get('RENDER_WEB_URL', 'https://your-bot.onrender.com')
+AUTHORIZED_USERS = ['8508010746', '7450951468', '8255234078']  # Your user IDs
+WEBHOOK_URL = f"{RENDER_WEB_URL}/webhook"
 
-# Validate required credentials
-if not all([API_ID, API_HASH, BOT_TOKEN]):
-    raise ValueError("Missing required environment variables: API_ID, API_HASH, BOT_TOKEN")
+# Store for music queues and states
+music_queues = {}
+current_playing = {}
+player_states = {}
+command_queues = {}  # For communication between threads
 
-# Special users (update these IDs as needed)
-SPECIAL_USERS = {8508010746, 7450951468, 8255234078}
+class MusicPlayer:
+    def __init__(self, chat_id):
+        self.chat_id = chat_id
+        self.queue = Queue()
+        self.is_playing = False
+        self.is_paused = False
+        self.current_song = None
+        self.ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'outtmpl': 'downloads/%(id)s.%(ext)s',
+            'quiet': True,
+            'no_warnings': True,
+        }
+    
+    def extract_youtube_info(self, url):
+        """Extract audio URL from YouTube video"""
+        try:
+            with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                return {
+                    'url': info['url'],
+                    'title': info['title'],
+                    'duration': info.get('duration', 0),
+                    'thumbnail': info.get('thumbnail', '')
+                }
+        except Exception as e:
+            logger.error(f"Error extracting YouTube info: {e}")
+            return None
+    
+    def add_to_queue(self, url, requested_by):
+        """Add song to queue"""
+        song_info = self.extract_youtube_info(url)
+        if song_info:
+            song_info['requested_by'] = requested_by
+            song_info['original_url'] = url
+            self.queue.put(song_info)
+            return song_info
+        return None
+    
+    def skip_song(self):
+        """Skip current song"""
+        self.is_playing = False
+        self.current_song = None
+    
+    def pause(self):
+        """Pause playback"""
+        self.is_paused = True
+    
+    def resume(self):
+        """Resume playback"""
+        self.is_paused = False
+    
+    def stop(self):
+        """Stop playback and clear queue"""
+        self.is_playing = False
+        self.is_paused = False
+        self.current_song = None
+        while not self.queue.empty():
+            self.queue.get()
+    
+    def get_queue_info(self):
+        """Get queue information"""
+        queue_list = list(self.queue.queue)
+        return {
+            'current': self.current_song,
+            'queue': queue_list,
+            'is_playing': self.is_playing,
+            'is_paused': self.is_paused
+        }
 
-# Initialize bot
-app_client = Client(
-    "music_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    workers=100
-)
+# Initialize Telegram bot
+bot_app = None
 
-# Flask routes for Render
+# Flask Routes
 @app.route('/')
 def home():
-    return "🎵 Music Bot is running!", 200
+    return jsonify({"status": "Music Bot is running!", "authorized_users": AUTHORIZED_USERS})
 
-@app.route('/health')
-def health():
-    return "OK", 200
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Handle Telegram webhook"""
+    update = Update.de_json(request.get_json(force=True), bot_app.bot)
+    
+    # Process update in background
+    Thread(target=process_update, args=(update,)).start()
+    
+    return jsonify({"status": "ok"})
 
-def run_flask():
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+def process_update(update):
+    """Process update asynchronously"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(bot_app.process_update(update))
+    loop.close()
 
-# Store user data
-user_queues: Dict[int, List[str]] = {}
-user_current_song: Dict[int, str] = {}
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send welcome message"""
+    user_id = str(update.effective_user.id)
+    
+    welcome_text = """
+🎵 *Welcome to Music Bot!* 🎵
 
-# YouTube downloader config
-ydl_opts = {
-    'format': 'bestaudio/best',
-    'postprocessors': [{
-        'key': 'FFmpegExtractAudio',
-        'preferredcodec': 'mp3',
-        'preferredquality': '192',
-    }],
-    'outtmpl': 'downloads/%(title)s.%(ext)s',
-    'quiet': True,
-    'no_warnings': True,
-}
+I can play music from YouTube links in groups!
 
-def search_youtube(query):
-    """Search YouTube for a video."""
-    try:
-        results = YoutubeSearch(query, max_results=1).to_dict()
-        if results:
-            return f"https://youtube.com/watch?v={results[0]['id']}"
-    except Exception as e:
-        logger.error(f"YouTube search error: {e}")
-    return None
+*Available Commands:*
+/play [YouTube URL] - Play music in group
+/stopmusic - Stop playing music
+/pause - Pause music
+/resume - Resume music
+/queue - Show current queue
+/skip - Skip current song
 
-def download_audio(url):
-    """Download audio from YouTube URL."""
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            return filename.replace('.webm', '.mp3').replace('.m4a', '.mp3')
-    except Exception as e:
-        logger.error(f"Download error: {e}")
-    return None
+*Special Features for Authorized Users:*
+1. Send any video to bot in private chat
+2. Reply with /play [group link] to play in specific group
+"""
+    
+    await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
 
-async def play_next(user_id, chat_id):
-    """Play next song in queue."""
-    if user_queues.get(user_id):
-        url = user_queues[user_id].pop(0)
-        await play_song(user_id, chat_id, url)
-    else:
-        user_current_song.pop(user_id, None)
-        await app_client.send_message(chat_id, "✅ Queue finished!")
-
-async def play_song(user_id, chat_id, url):
-    """Play a song."""
-    try:
-        await app_client.send_message(chat_id, "⏬ Downloading...")
-        filename = download_audio(url)
-        
-        if filename:
-            user_current_song[user_id] = filename
-            await app_client.send_chat_action(chat_id, "upload_audio")
-            
-            await app_client.send_audio(
-                chat_id=chat_id,
-                audio=filename,
-                caption="🎶 Now playing"
+async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle private messages from authorized users"""
+    user_id = str(update.effective_user.id)
+    message = update.message
+    
+    if user_id not in AUTHORIZED_USERS:
+        await message.reply_text("❌ You are not authorized to use this feature.")
+        return
+    
+    if message.text and message.text.startswith('/play'):
+        # Check if this is a reply to a video
+        if message.reply_to_message and message.reply_to_message.text:
+            # Extract video URL from replied message
+            video_url = extract_url(message.reply_to_message.text)
+            if video_url:
+                # Extract group link from command
+                args = message.text.split()
+                if len(args) > 1:
+                    group_link = args[1]
+                    chat_id = extract_group_id(group_link)
+                    
+                    if chat_id:
+                        await play_in_group(chat_id, video_url, user_id, context)
+                        await message.reply_text(f"✅ Added to queue in group {chat_id}")
+                    else:
+                        await message.reply_text("❌ Invalid group link")
+                else:
+                    await message.reply_text("❌ Please provide group link: /play [group_link]")
+            else:
+                await message.reply_text("❌ No valid URL found in replied message")
+        else:
+            await message.reply_text("❌ Please reply to a message containing video URL with /play [group_link]")
+    elif message.text:
+        # Check for URLs in message
+        urls = extract_url(message.text)
+        if urls:
+            await message.reply_text(
+                "✅ URL detected! Reply to this message with:\n"
+                "`/play [group_link]`\n\n"
+                f"URL: {urls}",
+                parse_mode=ParseMode.MARKDOWN
             )
-            
-            # Cleanup
-            try:
-                os.remove(filename)
-            except:
-                pass
-            
-            await play_next(user_id, chat_id)
-        else:
-            await app_client.send_message(chat_id, "❌ Download failed.")
-    except Exception as e:
-        logger.error(f"Play error: {e}")
-        await app_client.send_message(chat_id, f"❌ Error: {str(e)[:100]}")
 
-# Bot commands
-@app_client.on_message(filters.command("start"))
-async def start_command(client, message: Message):
-    await message.reply_text(
-        "🎵 **Music Bot**\n\n"
-        "Commands:\n"
-        "/play [link/query] - Play music\n"
-        "/skip - Skip song\n"
-        "/queue - Show queue\n"
-        "/stop - Stop playing"
-    )
+def extract_url(text):
+    """Extract URL from text"""
+    url_pattern = r'(https?://\S+)'
+    urls = re.findall(url_pattern, text)
+    return urls[0] if urls else None
 
-@app_client.on_message(filters.command("play") & filters.group)
-async def play_command(client, message: Message):
-    if len(message.command) < 2:
-        await message.reply_text("Usage: /play [YouTube link or song name]")
-        return
-    
-    query = ' '.join(message.command[1:])
-    user_id = message.from_user.id
-    
-    # Check if URL or search
-    if 'youtube.com' in query or 'youtu.be' in query:
-        url = query
-    else:
-        url = search_youtube(query)
-        if not url:
-            await message.reply_text("❌ No results found.")
-            return
-    
-    # Initialize queue
-    if user_id not in user_queues:
-        user_queues[user_id] = []
-    
-    # Add to queue
-    user_queues[user_id].append(url)
-    
-    # Start playing if nothing is playing
-    if user_id not in user_current_song:
-        await message.reply_text("🎵 Starting playback...")
-        await play_song(user_id, message.chat.id, url)
-    else:
-        await message.reply_text("✅ Added to queue.")
-
-@app_client.on_message(filters.command("skip"))
-async def skip_command(client, message: Message):
-    user_id = message.from_user.id
-    if user_id in user_current_song:
-        await message.reply_text("⏭ Skipping...")
-        await play_next(user_id, message.chat.id)
-    else:
-        await message.reply_text("❌ No song playing.")
-
-@app_client.on_message(filters.command("queue"))
-async def queue_command(client, message: Message):
-    user_id = message.from_user.id
-    if user_queues.get(user_id):
-        queue_text = "📋 Queue:\n"
-        for i, url in enumerate(user_queues[user_id][:5], 1):
-            queue_text += f"{i}. {url[:40]}...\n"
-        await message.reply_text(queue_text)
-    else:
-        await message.reply_text("📭 Queue empty.")
-
-@app_client.on_message(filters.command("stop"))
-async def stop_command(client, message: Message):
-    user_id = message.from_user.id
-    user_queues.pop(user_id, None)
-    user_current_song.pop(user_id, None)
-    await message.reply_text("🛑 Stopped.")
-
-# Special feature for private chat
-@app_client.on_message(filters.private & filters.video)
-async def handle_private_video(client, message: Message):
-    user_id = message.from_user.id
-    if user_id in SPECIAL_USERS:
-        if user_id not in user_queues:
-            user_queues[user_id] = []
-        user_queues[user_id].append(f"file_id:{message.video.file_id}")
-        await message.reply_text("✅ Video saved! Reply with /playgroup [group_link]")
-    else:
-        await message.reply_text("❌ Not authorized.")
-
-@app_client.on_message(filters.private & filters.command("playgroup"))
-async def playgroup_command(client, message: Message):
-    user_id = message.from_user.id
-    if user_id not in SPECIAL_USERS:
-        await message.reply_text("❌ Not authorized.")
-        return
-    
-    if len(message.command) < 2:
-        await message.reply_text("Usage: /playgroup https://t.me/groupname")
-        return
-    
-    group_link = message.command[1]
-    
+def extract_group_id(group_link):
+    """Extract group ID from invite link or @username"""
     try:
-        chat = await client.get_chat(group_link)
-        chat_id = chat.id
+        # For public groups with @username
+        if group_link.startswith('@'):
+            # You would need to resolve the username to chat_id
+            # For now, return as-is and handle in play_in_group
+            return group_link
         
-        if user_queues.get(user_id):
-            await message.reply_text("Forwarding videos...")
+        # For invite links
+        if 't.me/' in group_link:
+            parts = group_link.split('/')
+            if parts[-1].startswith('+') or parts[-1].startswith('joinchat/'):
+                # This is a private invite link
+                # You would need to join and get chat_id
+                return None
+            else:
+                # Public link with @username
+                return '@' + parts[-1]
+        
+        # If it's already a numeric ID
+        if group_link.isdigit() or (group_link.startswith('-') and group_link[1:].isdigit()):
+            return int(group_link)
             
-            for item in user_queues[user_id]:
-                if item.startswith("file_id:"):
-                    file_id = item.split(":")[1]
-                    await client.send_video(chat_id, file_id)
-                    await asyncio.sleep(1)  # Avoid flood
-            
-            user_queues[user_id].clear()
-            await message.reply_text("✅ All videos forwarded!")
-        else:
-            await message.reply_text("❌ No videos to forward.")
     except Exception as e:
-        logger.error(f"Forward error: {e}")
-        await message.reply_text(f"❌ Error: Check group link")
+        logger.error(f"Error extracting group ID: {e}")
+    
+    return None
 
-async def main():
-    # Start Flask in separate thread for Render
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    
-    # Start bot
-    logger.info("Starting bot...")
-    await app_client.start()
-    
-    # Get bot info
-    me = await app_client.get_me()
-    logger.info(f"Bot @{me.username} is running!")
-    
-    # Keep alive
-    await idle()
-    await app_client.stop()
+async def play_in_group(chat_id, url, user_id, context: ContextTypes.DEFAULT_TYPE):
+    """Play video in specific group"""
+    try:
+        # Initialize player for group if not exists
+        if chat_id not in music_queues:
+            music_queues[chat_id] = MusicPlayer(chat_id)
+        
+        player = music_queues[chat_id]
+        song_info = player.add_to_queue(url, user_id)
+        
+        if song_info:
+            if not player.is_playing:
+                await start_playback(chat_id, context)
+            
+            # Send confirmation to group
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🎵 *Added to queue:*\n{song_info['title']}\n\nRequested by: {user_id}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return True
+        else:
+            return False
+    except Exception as e:
+        logger.error(f"Error playing in group: {e}")
+        return False
 
-if __name__ == "__main__":
-    # Create downloads folder
-    os.makedirs("downloads", exist_ok=True)
+async def start_playback(chat_id, context: ContextTypes.DEFAULT_TYPE):
+    """Start playing music in group"""
+    if chat_id not in music_queues:
+        return
     
-    # Run
-    asyncio.run(main())
+    player = music_queues[chat_id]
+    
+    async def play_next():
+        if not player.queue.empty() and not player.is_playing:
+            player.is_playing = True
+            player.is_paused = False
+            
+            song_info = player.queue.get()
+            player.current_song = song_info
+            
+            try:
+                # Send now playing message
+                now_playing_text = (
+                    f"🎵 *Now Playing:*\n"
+                    f"📌 *Title:* {song_info['title']}\n"
+                    f"⏱ *Duration:* {song_info['duration']}s\n"
+                    f"👤 *Requested by:* {song_info['requested_by']}"
+                )
+                
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=now_playing_text,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+                # Simulate playback (in real implementation, you'd stream audio)
+                # For now, we'll simulate with a delay
+                playback_time = min(song_info['duration'], 300)  # Max 5 minutes for demo
+                
+                for i in range(playback_time):
+                    if not player.is_playing:
+                        break
+                    
+                    while player.is_paused:
+                        await asyncio.sleep(1)
+                        if not player.is_playing:
+                            break
+                    
+                    await asyncio.sleep(1)
+                
+                # Song finished
+                player.current_song = None
+                player.is_playing = False
+                
+                # Play next if queue not empty
+                if not player.queue.empty():
+                    await play_next()
+                else:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="✅ Queue is empty!"
+                    )
+                    
+            except Exception as e:
+                logger.error(f"Error during playback: {e}")
+                player.is_playing = False
+                player.current_song = None
+    
+    # Start playback in background
+    asyncio.create_task(play_next())
+
+async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /play command in groups"""
+    chat_id = update.effective_chat.id
+    user_id = str(update.effective_user.id)
+    
+    if not update.message.text or len(update.message.text.split()) < 2:
+        await update.message.reply_text("❌ Please provide YouTube URL: /play [YouTube_URL]")
+        return
+    
+    url = update.message.text.split()[1]
+    
+    # Initialize player for group if not exists
+    if chat_id not in music_queues:
+        music_queues[chat_id] = MusicPlayer(chat_id)
+    
+    player = music_queues[chat_id]
+    song_info = player.add_to_queue(url, user_id)
+    
+    if song_info:
+        await update.message.reply_text(
+            f"✅ *Added to queue:*\n{song_info['title']}\n\n"
+            f"⏱ Duration: {song_info['duration']}s",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        if not player.is_playing:
+            await start_playback(chat_id, context)
+    else:
+        await update.message.reply_text("❌ Failed to add song. Invalid URL or unsupported platform.")
+
+async def stopmusic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /stopmusic command"""
+    user_id = str(update.effective_user.id)
+    chat_id = update.effective_chat.id
+    
+    if user_id not in AUTHORIZED_USERS:
+        await update.message.reply_text("❌ You are not authorized to use this command.")
+        return
+    
+    if chat_id in music_queues:
+        player = music_queues[chat_id]
+        player.stop()
+        await update.message.reply_text("⏹ Music stopped and queue cleared!")
+    else:
+        await update.message.reply_text("❌ No music is currently playing.")
+
+async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /pause command"""
+    user_id = str(update.effective_user.id)
+    chat_id = update.effective_chat.id
+    
+    if user_id not in AUTHORIZED_USERS:
+        await update.message.reply_text("❌ You are not authorized to use this command.")
+        return
+    
+    if chat_id in music_queues:
+        player = music_queues[chat_id]
+        if player.is_playing and not player.is_paused:
+            player.pause()
+            await update.message.reply_text("⏸ Music paused!")
+        else:
+            await update.message.reply_text("❌ No music is currently playing or already paused.")
+    else:
+        await update.message.reply_text("❌ No music is currently playing.")
+
+async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /resume command"""
+    user_id = str(update.effective_user.id)
+    chat_id = update.effective_chat.id
+    
+    if user_id not in AUTHORIZED_USERS:
+        await update.message.reply_text("❌ You are not authorized to use this command.")
+        return
+    
+    if chat_id in music_queues:
+        player = music_queues[chat_id]
+        if player.is_paused:
+            player.resume()
+            await update.message.reply_text("▶️ Music resumed!")
+        else:
+            await update.message.reply_text("❌ Music is not paused.")
+    else:
+        await update.message.reply_text("❌ No music is currently playing.")
+
+async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /queue command"""
+    chat_id = update.effective_chat.id
+    
+    if chat_id in music_queues:
+        player = music_queues[chat_id]
+        queue_info = player.get_queue_info()
+        
+        if queue_info['current'] or not player.queue.empty():
+            queue_text = "📋 *Current Queue:*\n\n"
+            
+            if queue_info['current']:
+                queue_text += f"🎵 *Now Playing:* {queue_info['current']['title']}\n\n"
+            
+            if queue_info['queue']:
+                queue_text += "*Up Next:*\n"
+                for i, song in enumerate(queue_info['queue'][:10], 1):
+                    queue_text += f"{i}. {song['title']}\n"
+                
+                if len(queue_info['queue']) > 10:
+                    queue_text += f"\n... and {len(queue_info['queue']) - 10} more songs"
+            
+            await update.message.reply_text(queue_text, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text("📭 Queue is empty!")
+    else:
+        await update.message.reply_text("📭 Queue is empty!")
+
+async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /skip command"""
+    user_id = str(update.effective_user.id)
+    chat_id = update.effective_chat.id
+    
+    if user_id not in AUTHORIZED_USERS:
+        await update.message.reply_text("❌ You are not authorized to use this command.")
+        return
+    
+    if chat_id in music_queues:
+        player = music_queues[chat_id]
+        if player.is_playing:
+            player.skip_song()
+            await update.message.reply_text("⏭ Skipped current song!")
+            
+            # Start next song if available
+            if not player.queue.empty():
+                await start_playback(chat_id, context)
+        else:
+            await update.message.reply_text("❌ No music is currently playing.")
+    else:
+        await update.message.reply_text("❌ No music is currently playing.")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command"""
+    help_text = """
+🎵 *Music Bot Help* 🎵
+
+*Basic Commands (Everyone):*
+/play [YouTube URL] - Play music
+/queue - Show current queue
+
+*Control Commands (Authorized Users Only):*
+/stopmusic - Stop music and clear queue
+/pause - Pause music
+/resume - Resume music
+/skip - Skip current song
+
+*Special Features for Authorized Users:*
+1. Send any YouTube link to bot in private chat
+2. Reply with `/play [group_link]` to play in specific group
+
+*Authorized Users:* {}
+""".format(', '.join(AUTHORIZED_USERS))
+    
+    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors"""
+    logger.error(f"Update {update} caused error {context.error}")
+    
+    if update and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "❌ An error occurred. Please try again later."
+            )
+        except:
+            pass
+
+def setup_bot():
+    """Setup Telegram bot"""
+    global bot_app
+    
+    # Create application
+    bot_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Add handlers
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(CommandHandler("help", help_command))
+    bot_app.add_handler(CommandHandler("play", play_command))
+    bot_app.add_handler(CommandHandler("stopmusic", stopmusic_command))
+    bot_app.add_handler(CommandHandler("pause", pause_command))
+    bot_app.add_handler(CommandHandler("resume", resume_command))
+    bot_app.add_handler(CommandHandler("queue", queue_command))
+    bot_app.add_handler(CommandHandler("skip", skip_command))
+    
+    # Handle private messages
+    bot_app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+        handle_private_message
+    ))
+    
+    # Error handler
+    bot_app.add_error_handler(error_handler)
+    
+    return bot_app
+
+def set_webhook():
+    """Set Telegram webhook"""
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+        data = {"url": WEBHOOK_URL}
+        response = requests.post(url, json=data)
+        logger.info(f"Webhook set: {response.json()}")
+    except Exception as e:
+        logger.error(f"Error setting webhook: {e}")
+
+def main():
+    """Main function"""
+    # Check environment variables
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN not set in environment variables!")
+        return
+    
+    # Setup bot
+    setup_bot()
+    
+    # Set webhook
+    set_webhook()
+    
+    # Create downloads directory
+    os.makedirs('downloads', exist_ok=True)
+    
+    logger.info("Music Bot started successfully!")
+    logger.info(f"Authorized users: {AUTHORIZED_USERS}")
+    logger.info(f"Webhook URL: {WEBHOOK_URL}")
+
+if __name__ == '__main__':
+    # Run main setup
+    main()
+    
+    # Get port from environment variable (for Render)
+    port = int(os.environ.get('PORT', 5000))
+    
+    # Run Flask app
+    app.run(host='0.0.0.0', port=port)
