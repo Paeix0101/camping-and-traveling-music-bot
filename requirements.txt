@@ -1,7 +1,8 @@
 flask==2.3.3
 requests==2.31.0
-youtube-dl==2021.12.17
 yt-dlp==2023.7.6
-pytube==15.0.0
 pytelegrambotapi==4.14.0
 gunicorn==21.2.0
+pydub==0.25.1
+ffmpeg-python==0.2.0
+python-dotenv==1.0.0
