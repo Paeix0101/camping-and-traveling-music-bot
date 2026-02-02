@@ -1,6 +1,6 @@
 pyrogram
 tgcrypto
-git+https://github.com/pytgcalls/pytgcalls.git
+git+https://github.com/pytgcalls/pytgcalls.git@main
 yt-dlp
 flask
 requests
