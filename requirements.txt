@@ -1,6 +1,7 @@
+# requirements.txt
 pyrogram
 tgcrypto
-py-tgcalls
+py-tgcalls==2.1.0
 yt-dlp
 flask
 requests

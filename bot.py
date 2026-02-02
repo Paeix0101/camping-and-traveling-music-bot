@@ -1,10 +1,11 @@
+# bot.py
 import os
 import asyncio
 from flask import Flask, request
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pytgcalls import PyTgCalls
-from pytgcalls.types import AudioPiped
+from pytgcalls.types.input_stream import AudioPiped
 from yt_dlp import YoutubeDL
 
 # ================== CONFIG ==================
@@ -133,4 +134,3 @@ if __name__ == "__main__":
     host="0.0.0.0",
     port=int(os.environ.get("PORT", 10000))
 )
-
