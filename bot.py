@@ -4,7 +4,7 @@ from flask import Flask, request
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pytgcalls import PyTgCalls
-from pytgcalls.types.input_stream import AudioPiped
+from pytgcalls.types import AudioPiped
 from yt_dlp import YoutubeDL
 
 # ================== CONFIG ==================
@@ -129,4 +129,8 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(main())
-    app.run(host="0.0.0.0", port=10000)
+    app.run(
+    host="0.0.0.0",
+    port=int(os.environ.get("PORT", 10000))
+)
+
