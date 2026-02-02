@@ -1,7 +1,7 @@
-# requirements.txt
+# requirements.txt   ← change to this
 pyrogram
 tgcrypto
-py-tgcalls==2.1.0
+py-tgcalls==2.1.0     # ← this version has from pytgcalls.types import AudioPiped
 yt-dlp
 flask
 requests
