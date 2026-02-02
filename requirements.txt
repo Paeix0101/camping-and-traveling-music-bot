@@ -1,4 +1,4 @@
-pyrogram
+pyrogram==1.4.16
 tgcrypto
 git+https://github.com/pytgcalls/pytgcalls.git@main
 yt-dlp
