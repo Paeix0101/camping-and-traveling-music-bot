@@ -1,26 +1,38 @@
-# bot.py (updated for modern pytgcalls ~2026)
+# bot.py
 import os
 import asyncio
 from flask import Flask, request
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pytgcalls import PyTgCalls, idle  # idle may be optional
-from pytgcalls.types import AudioPiped  # try this; if fails → see alternatives below
+from pytgcalls import PyTgCalls
+from pytgcalls.types import AudioPiped
 from yt_dlp import YoutubeDL
 
-# CONFIG (same as before)
+# ================== CONFIG ==================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # This will be your Render service URL, e.g., https://your-service.onrender.com
 
-AUTHORIZED_USERS = {8508010746, 7450951468, 8255234078}
+AUTHORIZED_USERS = {
+    8508010746,
+    7450951468,
+    8255234078
+}
+
+# ============================================
 
 app = Flask(__name__)
 
-bot = Client("musicbot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+bot = Client(
+    "musicbot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
-pytgcalls = PyTgCalls(bot)  # renamed from 'call' for clarity
+call = PyTgCalls(bot)
 
 ydl_opts = {
     "format": "bestaudio/best",
@@ -28,57 +40,98 @@ ydl_opts = {
     "no_warnings": True,
 }
 
-def get_stream_url(query: str):
+# ================== HELPERS ==================
+
+def download_audio(url):
     with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(query, download=False)
-        if 'entries' in info:
-            info = info['entries'][0]
-        return info.get('url') or info.get('formats')[0]['url']
+        info = ydl.extract_info(url, download=False)
+        return info["url"]
 
-# COMMANDS (adapted)
-@bot.on_message(filters.command("play") & filters.group)
-async def play_youtube(client, message: Message):
+# ================== COMMANDS ==================
+
+@bot.on_message(filters.command("play") & filters.private)
+async def play_from_private(client: Client, message: Message):
     if message.from_user.id not in AUTHORIZED_USERS:
-        return
-    if len(message.command) < 2:
-        return await message.reply("Give YouTube link or search term")
-    
-    query = " ".join(message.command[1:])
-    stream_url = get_stream_url(query)
-    
-    try:
-        # Modern play method (preferred in recent pytgcalls)
-        await pytgcalls.play(
-            message.chat.id,
-            AudioPiped(stream_url)  # or just stream_url if it accepts str directly
-        )
-        await message.reply(f"🎶 Playing: {query}")
-    except Exception as e:
-        await message.reply(f"Error: {str(e)}")
+        return await message.reply("❌ Not authorized")
 
-# Add similar adaptation for private / video play if needed
-# Pause, resume, stop remain similar:
+    if not message.reply_to_message or not message.reply_to_message.video:
+        return await message.reply("Reply to a video with `/play group_link`")
+
+    if len(message.command) < 2:
+        return await message.reply("Usage: /play <group_link>")
+
+    group_link = message.command[1]
+    chat = await client.get_chat(group_link)
+    chat_id = chat.id
+
+    video = message.reply_to_message.video
+    file_path = await client.download_media(video)
+
+    await call.join_group_call(
+        chat_id,
+        AudioPiped(file_path)
+    )
+
+    await message.reply("▶️ Playing video in group")
+
 @bot.on_message(filters.command("pause"))
 async def pause_music(client, message):
-    if message.from_user.id not in AUTHORIZED_USERS: return
-    await pytgcalls.pause_stream(message.chat.id)
+    if message.from_user.id not in AUTHORIZED_USERS:
+        return
+    await call.pause_stream(message.chat.id)
     await message.reply("⏸ Paused")
 
-# ... resume and stop similarly, using pytgcalls.resume_stream / leave_group_call
+@bot.on_message(filters.command("resume"))
+async def resume_music(client, message):
+    if message.from_user.id not in AUTHORIZED_USERS:
+        return
+    await call.resume_stream(message.chat.id)
+    await message.reply("▶️ Resumed")
 
-# WEBHOOK & START
+@bot.on_message(filters.command("stopmusic"))
+async def stop_music(client, message):
+    if message.from_user.id not in AUTHORIZED_USERS:
+        return
+    await call.leave_group_call(message.chat.id)
+    await message.reply("⏹ Stopped")
+
+@bot.on_message(filters.command("play") & filters.group)
+async def play_youtube(client, message):
+    if message.from_user.id not in AUTHORIZED_USERS:
+        return
+
+    if len(message.command) < 2:
+        return await message.reply("Give YouTube link")
+
+    url = message.command[1]
+    audio_url = download_audio(url)
+
+    await call.join_group_call(
+        message.chat.id,
+        AudioPiped(audio_url)
+    )
+
+    await message.reply("🎶 Playing YouTube audio")
+
+# ================== WEBHOOK ==================
+
 @app.route("/", methods=["POST"])
 def webhook():
     update = request.get_json()
     asyncio.get_event_loop().create_task(bot.process_update(update))
     return "OK"
 
+# ================== START ==================
+
 async def main():
     await bot.start()
-    await pytgcalls.start()
+    await call.start()
     await bot.set_webhook(WEBHOOK_URL)
     print("Bot started")
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(main())
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000))
+    )
