@@ -1,215 +1,132 @@
 import os
-import subprocess
-from flask import Flask
-from threading import Thread
-from pyrogram import Client, filters, idle
+import asyncio
+from flask import Flask, request
+from pyrogram import Client, filters
+from pyrogram.types import Message
 from pytgcalls import PyTgCalls
-from pytgcalls.types import AudioPiped
-from pytgcalls.types.input_stream.quality import HighQualityAudio
+from pytgcalls.types.input_stream import AudioPiped
+from yt_dlp import YoutubeDL
 
-flask_app = Flask(__name__)
+# ================== CONFIG ==================
 
-@flask_app.route('/')
-def home():
-    return "Bot is alive!"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-ADMINS = [8508010746, 7450951468, 8255234078]
+AUTHORIZED_USERS = {
+    8508010746,
+    7450951468,
+    8255234078
+}
 
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")
-SESSION_STRING = os.environ.get("SESSION_STRING")
+# ============================================
 
-client = Client(
-    ":memory:",
+app = Flask(__name__)
+
+bot = Client(
+    "musicbot",
     api_id=API_ID,
     api_hash=API_HASH,
-    session_string=SESSION_STRING
+    bot_token=BOT_TOKEN
 )
 
-py = PyTgCalls(client)
+call = PyTgCalls(bot)
 
-def get_yt_link(url):
-    proc = subprocess.Popen(
-        ["yt-dlp", "-g", "-f", "bestaudio", "--no-warnings", "--no-playlist", url],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT
+ydl_opts = {
+    "format": "bestaudio",
+    "quiet": True
+}
+
+# ================== HELPERS ==================
+
+def download_audio(url):
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        return info["url"]
+
+# ================== COMMANDS ==================
+
+@bot.on_message(filters.command("play") & filters.private)
+async def play_from_private(client: Client, message: Message):
+    if message.from_user.id not in AUTHORIZED_USERS:
+        return await message.reply("❌ Not authorized")
+
+    if not message.reply_to_message or not message.reply_to_message.video:
+        return await message.reply("Reply to a video with `/play group_link`")
+
+    if len(message.command) < 2:
+        return await message.reply("Usage: /play <group_link>")
+
+    group_link = message.command[1]
+    chat = await client.get_chat(group_link)
+    chat_id = chat.id
+
+    video = message.reply_to_message.video
+    file_path = await client.download_media(video)
+
+    await call.join_group_call(
+        chat_id,
+        AudioPiped(file_path)
     )
-    stdout, _ = proc.communicate()
-    if proc.returncode != 0:
-        raise Exception(f"yt-dlp failed: {stdout.decode()}")
-    links = stdout.decode().strip().split("\n")
-    return links[0]  # First link is usually the audio
 
-async def get_chat_id_from_link(group):
-    if group.startswith("@"):
-        username = group[1:]
-        chat = await client.get_chat(username)
-        return chat.id
-    elif group.startswith("https://t.me/"):
-        if "/+" in group or "/joinchat/" in group:
-            chat = await client.join_chat(group)
-            return chat.id
-        else:
-            username = group.split("/")[-1]
-            chat = await client.get_chat(username)
-            return chat.id
-    else:
-        raise ValueError("Invalid group link")
+    await message.reply("▶️ Playing in group")
 
-# Private commands for admins
-
-@client.on_message(filters.private & filters.user(ADMINS) & filters.command("play"))
-async def play_private(c, m):
-    if not m.reply_to_message:
-        await m.reply("Please reply to a message containing the YouTube link.")
+@bot.on_message(filters.command("pause"))
+async def pause_music(client, message):
+    if message.from_user.id not in AUTHORIZED_USERS:
         return
-    if len(m.command) < 2:
-        await m.reply("Usage: /play <group link> (reply to YouTube link)")
+    await call.pause_stream(message.chat.id)
+    await message.reply("⏸ Paused")
+
+@bot.on_message(filters.command("resume"))
+async def resume_music(client, message):
+    if message.from_user.id not in AUTHORIZED_USERS:
+        return
+    await call.resume_stream(message.chat.id)
+    await message.reply("▶️ Resumed")
+
+@bot.on_message(filters.command("stopmusic"))
+async def stop_music(client, message):
+    if message.from_user.id not in AUTHORIZED_USERS:
+        return
+    await call.leave_group_call(message.chat.id)
+    await message.reply("⏹ Stopped")
+
+@bot.on_message(filters.command("play") & filters.group)
+async def play_youtube(client, message):
+    if message.from_user.id not in AUTHORIZED_USERS:
         return
 
-    group = m.command[1]
-    try:
-        chat_id = await get_chat_id_from_link(group)
-    except Exception as e:
-        await m.reply(f"Invalid group or can't access: {e}")
-        return
+    if len(message.command) < 2:
+        return await message.reply("Give YouTube link")
 
-    url = m.reply_to_message.text.strip()
-    try:
-        direct = get_yt_link(url)
-        call = await py.get_group_call(chat_id)
-        stream = AudioPiped(direct, audio_parameters=HighQualityAudio())
-        if call:
-            await py.change_stream(chat_id, stream)
-        else:
-            await py.join_group_call(chat_id, stream)
-        await m.reply(f"Playing in the group.")
-    except Exception as e:
-        await m.reply(f"Error: {str(e)}")
+    url = message.command[1]
+    audio_url = download_audio(url)
 
-@client.on_message(filters.private & filters.user(ADMINS) & filters.command("pause"))
-async def pause_private(c, m):
-    if len(m.command) < 2:
-        await m.reply("Usage: /pause <group link>")
-        return
+    await call.join_group_call(
+        message.chat.id,
+        AudioPiped(audio_url)
+    )
 
-    group = m.command[1]
-    try:
-        chat_id = await get_chat_id_from_link(group)
-    except Exception as e:
-        await m.reply(f"Invalid group or can't access: {e}")
-        return
+    await message.reply("🎶 Playing YouTube audio")
 
-    try:
-        await py.pause_stream(chat_id)
-        await m.reply("Paused music in the group.")
-    except Exception as e:
-        await m.reply(f"Error: {str(e)} (maybe not playing)")
+# ================== WEBHOOK ==================
 
-@client.on_message(filters.private & filters.user(ADMINS) & filters.command("resume"))
-async def resume_private(c, m):
-    if len(m.command) < 2:
-        await m.reply("Usage: /resume <group link>")
-        return
+@app.route("/", methods=["POST"])
+def webhook():
+    update = request.get_json()
+    asyncio.get_event_loop().create_task(bot.process_update(update))
+    return "OK"
 
-    group = m.command[1]
-    try:
-        chat_id = await get_chat_id_from_link(group)
-    except Exception as e:
-        await m.reply(f"Invalid group or can't access: {e}")
-        return
+# ================== START ==================
 
-    try:
-        await py.resume_stream(chat_id)
-        await m.reply("Resumed music in the group.")
-    except Exception as e:
-        await m.reply(f"Error: {str(e)} (maybe not paused)")
-
-@client.on_message(filters.private & filters.user(ADMINS) & filters.command("stopmusic"))
-async def stop_private(c, m):
-    if len(m.command) < 2:
-        await m.reply("Usage: /stopmusic <group link>")
-        return
-
-    group = m.command[1]
-    try:
-        chat_id = await get_chat_id_from_link(group)
-    except Exception as e:
-        await m.reply(f"Invalid group or can't access: {e}")
-        return
-
-    try:
-        await py.leave_group_call(chat_id)
-        await m.reply("Stopped music and left the voice chat in the group.")
-    except Exception as e:
-        await m.reply(f"Error: {str(e)} (maybe not in call)")
-
-# Optional: Group commands for direct control (admins only)
-
-@client.on_message(filters.group & filters.command("play"))
-async def play_group(c, m):
-    if m.from_user.id not in ADMINS:
-        await m.reply("Only admins can use this.")
-        return
-    url = None
-    if m.reply_to_message and m.reply_to_message.text:
-        url = m.reply_to_message.text.strip()
-    elif len(m.command) > 1:
-        url = m.command[1]
-    if not url:
-        await m.reply("Usage: /play <YouTube link> or reply to link with /play")
-        return
-
-    try:
-        direct = get_yt_link(url)
-        chat_id = m.chat.id
-        call = await py.get_group_call(chat_id)
-        stream = AudioPiped(direct, audio_parameters=HighQualityAudio())
-        if call:
-            await py.change_stream(chat_id, stream)
-        else:
-            await py.join_group_call(chat_id, stream)
-        await m.reply("Playing.")
-    except Exception as e:
-        await m.reply(f"Error: {str(e)}")
-
-@client.on_message(filters.group & filters.command("pause"))
-async def pause_group(c, m):
-    if m.from_user.id not in ADMINS:
-        return
-    try:
-        await py.pause_stream(m.chat.id)
-        await m.reply("Paused.")
-    except Exception as e:
-        await m.reply(f"Error: {str(e)}")
-
-@client.on_message(filters.group & filters.command("resume"))
-async def resume_group(c, m):
-    if m.from_user.id not in ADMINS:
-        return
-    try:
-        await py.resume_stream(m.chat.id)
-        await m.reply("Resumed.")
-    except Exception as e:
-        await m.reply(f"Error: {str(e)}")
-
-@client.on_message(filters.group & filters.command("stopmusic"))
-async def stop_group(c, m):
-    if m.from_user.id not in ADMINS:
-        return
-    try:
-        await py.leave_group_call(m.chat.id)
-        await m.reply("Stopped.")
-    except Exception as e:
-        await m.reply(f"Error: {str(e)}")
-
-def run_bot():
-    client.start()
-    py.start()
-    idle()
+async def main():
+    await bot.start()
+    await call.start()
+    await bot.set_webhook(WEBHOOK_URL)
+    print("Bot started")
 
 if __name__ == "__main__":
-    t = Thread(target=run_bot)
-    t.start()
-    port = int(os.environ.get("PORT", 5000))
-    flask_app.run(host="0.0.0.0", port=port)
+    asyncio.get_event_loop().run_until_complete(main())
+    app.run(host="0.0.0.0", port=10000)
