@@ -1,11 +1,9 @@
-# bot.py
 import os
 import asyncio
 from flask import Flask, request
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pytgcalls import PyTgCalls
-from pytgcalls.types import AudioPiped          # ← back to this
 from yt_dlp import YoutubeDL
 
 # ================== CONFIG ==================
@@ -35,16 +33,21 @@ bot = Client(
 call = PyTgCalls(bot)
 
 ydl_opts = {
-    "format": "bestaudio",
-    "quiet": True
+    "format": "bestaudio/best",
+    "quiet": True,
+    "no_warnings": True,
+    "default_search": "ytsearch",
+    "extract_flat": False,
 }
 
 # ================== HELPERS ==================
 
-def download_audio(url):
+def get_audio_stream_url(query_or_url: str):
     with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        return info["url"]
+        info = ydl.extract_info(query_or_url, download=False)
+        if 'entries' in info:  # playlist/search result
+            info = info['entries'][0]
+        return info['url']  # direct audio stream url
 
 # ================== COMMANDS ==================
 
@@ -66,12 +69,10 @@ async def play_from_private(client: Client, message: Message):
     video = message.reply_to_message.video
     file_path = await client.download_media(video)
 
-    await call.join_group_call(
-        chat_id,
-        AudioPiped(file_path)
-    )
+    # Modern way: use .play() instead of join + AudioPiped
+    await call.play(chat_id, file_path)  # or pass http url if preferred
 
-    await message.reply("▶️ Playing in group")
+    await message.reply("▶️ Playing video/audio in group")
 
 @bot.on_message(filters.command("pause"))
 async def pause_music(client, message):
@@ -100,17 +101,16 @@ async def play_youtube(client, message):
         return
 
     if len(message.command) < 2:
-        return await message.reply("Give YouTube link")
+        return await message.reply("Give YouTube link or search term")
 
-    url = message.command[1]
-    audio_url = download_audio(url)
+    query = message.command[1]
+    # support direct url or search term
+    audio_url = get_audio_stream_url(query)
 
-    await call.join_group_call(
-        message.chat.id,
-        AudioPiped(audio_url)
-    )
+    # Modern simplified play
+    await call.play(message.chat.id, audio_url)
 
-    await message.reply("🎶 Playing YouTube audio")
+    await message.reply(f"🎶 Playing: {query}")
 
 # ================== WEBHOOK ==================
 
@@ -125,8 +125,9 @@ def webhook():
 async def main():
     await bot.start()
     await call.start()
+    # Optional: await call.get_calls() or something to init
     await bot.set_webhook(WEBHOOK_URL)
-    print("Bot started")
+    print("Bot & calls started")
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(main())
