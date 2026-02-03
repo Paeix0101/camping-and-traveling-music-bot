@@ -2,13 +2,14 @@ import os
 import sys
 import logging
 import asyncio
-from threading import Thread
+import threading
 from flask import Flask, request, jsonify
 from telethon import TelegramClient, events
-from telethon.tl.types import InputPeerChannel
 import yt_dlp
 import json
 import traceback
+from queue import Queue
+import time
 
 # Configure logging
 logging.basicConfig(
@@ -30,52 +31,37 @@ SPECIAL_USERS = [8508010746, 7450951468, 8255234078]
 app = Flask(__name__)
 
 # Global bot instance
-music_bot = None
+bot_instance = None
+bot_loop = None
 
-class MusicBot:
+class TelegramBot:
     def __init__(self):
-        self.client = TelegramClient('bot_session', API_ID, API_HASH)
-        self.calls = None
-        self.current_playing = {}
-        self.paused_chats = set()
-        self.is_initialized = False
+        self.client = None
+        self.bot_info = None
+        self.is_running = False
+        self.message_queue = Queue()
         
-        # Try to import PyTgCalls (it might not be available initially)
+    async def initialize(self):
+        """Initialize the Telegram client"""
         try:
-            from pytgcalls import PyTgCalls
-            from pytgcalls.types import InputStream
-            from pytgcalls.types.input_stream import InputAudioStream
-            self.PyTgCalls = PyTgCalls
-            self.InputStream = InputStream
-            self.InputAudioStream = InputAudioStream
-            self.calls = PyTgCalls(self.client)
-            logger.info("PyTgCalls imported successfully")
-        except ImportError as e:
-            logger.error(f"PyTgCalls import error: {e}")
-            logger.warning("PyTgCalls not available. Some features may not work.")
-    
-    async def start(self):
-        try:
+            self.client = TelegramClient('bot_session', API_ID, API_HASH)
             await self.client.start(bot_token=BOT_TOKEN)
-            bot_info = await self.client.get_me()
-            logger.info(f"Bot started: @{bot_info.username}")
+            self.bot_info = await self.client.get_me()
+            logger.info(f"Bot started: @{self.bot_info.username}")
             
-            if self.calls:
-                await self.calls.start()
-                logger.info("PyTgCalls started")
-            
+            # Setup event handlers
             self.setup_handlers()
-            self.is_initialized = True
             
             # Send startup message
             await self.client.send_message('me', f'🎵 Music Bot Started!\nRender URL: {RENDER_WEB_URL}')
             
-            # Keep the bot running
-            await self.client.run_until_disconnected()
+            self.is_running = True
+            return True
             
         except Exception as e:
-            logger.error(f"Bot startup error: {e}")
+            logger.error(f"Failed to initialize bot: {e}")
             traceback.print_exc()
+            return False
     
     def setup_handlers(self):
         """Setup all event handlers"""
@@ -86,11 +72,12 @@ class MusicBot:
             await event.reply(
                 "🎵 **Music Bot Started!**\n\n"
                 "Available commands:\n"
-                "/play [youtube_url] - Play music\n"
+                "/play [youtube_url] - Play music (downloads audio)\n"
                 "/stopmusic - Stop playing (special users only)\n"
                 "/pause - Pause music (special users only)\n"
                 "/resume - Resume music (special users only)\n\n"
-                "**Special users** can forward music from private chat to groups!"
+                "**Special users** can forward media from private chat!\n"
+                f"Special Users: {', '.join(map(str, SPECIAL_USERS))}"
             )
         
         @self.client.on(events.NewMessage(pattern='/play'))
@@ -104,33 +91,29 @@ class MusicBot:
                         await self.handle_forwarded_media(event, reply_msg)
                         return
                 
-                # Regular play from YouTube link
+                # Regular YouTube download
                 if event.text:
-                    args = event.text.split()
+                    args = event.text.split(maxsplit=1)
                     if len(args) < 2:
-                        await event.reply("Please provide a YouTube URL!")
+                        await event.reply("Please provide a YouTube URL!\nExample: `/play https://youtu.be/VIDEO_ID`")
                         return
                     
-                    url = args[1]
-                    await self.play_youtube(event, url)
+                    url = args[1].strip()
+                    if 'youtube.com' in url or 'youtu.be' in url:
+                        await self.download_youtube(event, url)
+                    else:
+                        await event.reply("Please provide a valid YouTube URL!")
                     
             except Exception as e:
                 logger.error(f"Play handler error: {e}")
-                await event.reply(f"❌ Error: {str(e)}")
+                await event.reply(f"❌ Error: {str(e)[:200]}")
         
         @self.client.on(events.NewMessage(pattern='/stopmusic'))
         async def stop_handler(event):
             """Stop music for special users"""
             try:
                 if event.sender_id in SPECIAL_USERS:
-                    chat_id = event.chat_id
-                    if chat_id in self.current_playing and self.calls:
-                        await self.calls.leave_group_call(chat_id)
-                        self.current_playing.pop(chat_id, None)
-                        self.paused_chats.discard(chat_id)
-                        await event.reply("⏹️ Music stopped!")
-                    else:
-                        await event.reply("❌ No music is playing or PyTgCalls not available!")
+                    await event.reply("⏹️ Stop command received! (Note: This version downloads audio files. Voice chat features coming soon!)")
                 else:
                     await event.reply("❌ You don't have permission to use this command!")
             except Exception as e:
@@ -142,13 +125,7 @@ class MusicBot:
             """Pause music for special users"""
             try:
                 if event.sender_id in SPECIAL_USERS:
-                    chat_id = event.chat_id
-                    if chat_id in self.current_playing and chat_id not in self.paused_chats and self.calls:
-                        await self.calls.pause_stream(chat_id)
-                        self.paused_chats.add(chat_id)
-                        await event.reply("⏸️ Music paused!")
-                    else:
-                        await event.reply("❌ No music is playing or already paused!")
+                    await event.reply("⏸️ Pause command received! (Note: This version downloads audio files. Voice chat features coming soon!)")
                 else:
                     await event.reply("❌ You don't have permission to use this command!")
             except Exception as e:
@@ -160,13 +137,7 @@ class MusicBot:
             """Resume music for special users"""
             try:
                 if event.sender_id in SPECIAL_USERS:
-                    chat_id = event.chat_id
-                    if chat_id in self.current_playing and chat_id in self.paused_chats and self.calls:
-                        await self.calls.resume_stream(chat_id)
-                        self.paused_chats.discard(chat_id)
-                        await event.reply("▶️ Music resumed!")
-                    else:
-                        await event.reply("❌ No music is paused or playing!")
+                    await event.reply("▶️ Resume command received! (Note: This version downloads audio files. Voice chat features coming soon!)")
                 else:
                     await event.reply("❌ You don't have permission to use this command!")
             except Exception as e:
@@ -175,8 +146,12 @@ class MusicBot:
         
         @self.client.on(events.NewMessage(incoming=True))
         async def message_handler(event):
-            """Handle forwarded media from special users"""
+            """Handle all incoming messages"""
             try:
+                # Log the message
+                logger.info(f"Message from {event.sender_id} in chat {event.chat_id}: {event.text[:100] if event.text else 'Media message'}")
+                
+                # Handle forwarded media from special users
                 if event.sender_id in SPECIAL_USERS and event.is_private:
                     # Check if message contains media
                     if event.video or event.document:
@@ -184,9 +159,11 @@ class MusicBot:
                             "📥 **Media received!**\n\n"
                             "Now reply to this message with:\n"
                             "`/play [group_link]`\n\n"
-                            "Where `[group_link]` is the group where you want to play this media.\n"
-                            "Example: `/play https://t.me/yourgroup`"
+                            "Where `[group_link]` is the group where you want to send this media.\n"
+                            "Example: `/play https://t.me/yourgroup`\n\n"
+                            "Note: Voice chat features coming soon!"
                         )
+                
             except Exception as e:
                 logger.error(f"Message handler error: {e}")
     
@@ -194,97 +171,46 @@ class MusicBot:
         """Handle forwarded media from special users"""
         try:
             # Extract group link from command
-            args = event.text.split()
+            args = event.text.split(maxsplit=1)
             if len(args) < 2:
-                await event.reply("Please provide a group link!")
+                await event.reply("Please provide a group link!\nExample: `/play https://t.me/yourgroup`")
                 return
             
             group_link = args[1].strip()
             
-            # Download and send media
-            await event.reply("⬇️ Downloading media...")
-            file_path = await self.download_media(media_msg)
+            await event.reply("📤 Processing media...")
             
-            if file_path:
-                # Join the group and play media
-                await self.play_in_group(event, group_link, file_path)
-            else:
-                await event.reply("❌ Failed to download media!")
-                
-        except Exception as e:
-            logger.error(f"Error handling forwarded media: {e}")
-            traceback.print_exc()
-            await event.reply(f"❌ Error: {str(e)}")
-    
-    async def download_media(self, message):
-        """Download media from message"""
-        try:
-            if message.video:
-                media = message.video
-                file_extension = ".mp4"
-            elif message.document:
-                media = message.document
-                file_extension = ""
-            else:
-                return None
-            
-            # Create downloads directory
-            os.makedirs("downloads", exist_ok=True)
-            
-            # Download file
-            import time
-            filename = f"downloads/{int(time.time())}_{media.id}"
-            file_path = await message.download_media(file=filename + file_extension)
-            return file_path
-            
-        except Exception as e:
-            logger.error(f"Download error: {e}")
-            return None
-    
-    async def play_in_group(self, event, group_link, file_path):
-        """Play media in a specific group"""
-        try:
-            if not self.calls:
-                await event.reply("❌ Voice chat features are not available!")
-                return
-            
-            # Extract group ID from link
+            # Extract group username from link
             if 't.me/' in group_link:
                 group_username = group_link.split('t.me/')[-1].replace('+', '').replace('@', '')
                 
-                # Join the group
-                entity = await self.client.get_entity(group_username)
-                chat_id = entity.id
-                
-                # Send playing message
-                await event.reply(f"🎵 Playing in group: {entity.title}")
-                
-                # Play the audio
-                stream = self.InputStream(
-                    self.InputAudioStream(file_path),
-                )
-                await self.calls.join_group_call(chat_id, stream)
-                self.current_playing[chat_id] = file_path
-                
-                logger.info(f"Playing in group {chat_id}: {file_path}")
-                
+                try:
+                    # Get the group entity
+                    entity = await self.client.get_entity(group_username)
+                    
+                    # Forward the media to the group
+                    await self.client.send_message(entity.id, "📥 Media forwarded from private chat:")
+                    await self.client.send_file(entity.id, media_msg)
+                    
+                    await event.reply(f"✅ Media forwarded to: {entity.title}")
+                    
+                except Exception as e:
+                    logger.error(f"Group forwarding error: {e}")
+                    await event.reply(f"❌ Error forwarding to group: {str(e)[:200]}")
+                    
             else:
                 await event.reply("❌ Invalid group link! Use format: https://t.me/groupname")
                 
         except Exception as e:
-            logger.error(f"Error playing in group: {e}")
+            logger.error(f"Error handling forwarded media: {e}")
             traceback.print_exc()
-            await event.reply(f"❌ Error: {str(e)}")
+            await event.reply(f"❌ Error: {str(e)[:200]}")
     
-    async def play_youtube(self, event, url):
-        """Play YouTube audio"""
+    async def download_youtube(self, event, url):
+        """Download YouTube audio"""
         try:
-            if not self.calls:
-                await event.reply("❌ Voice chat features are not available!")
-                return
-            
             chat_id = event.chat_id
-            await event.reply("🎵 Processing YouTube link...")
+            await event.reply("🎵 Downloading YouTube audio...")
             
             # Ensure downloads directory exists
             os.makedirs("downloads", exist_ok=True)
@@ -297,9 +223,10 @@ class MusicBot:
                     'preferredcodec': 'mp3',
                     'preferredquality': '192',
                 }],
-                'outtmpl': 'downloads/%(id)s.%(ext)s',
+                'outtmpl': 'downloads/%(title)s.%(ext)s',
                 'quiet': False,
                 'no_warnings': True,
+                'extract_flat': False,
             }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -308,52 +235,92 @@ class MusicBot:
                 audio_file = os.path.splitext(filename)[0] + '.mp3'
             
             # Check if file exists
-            if not os.path.exists(audio_file):
+            if os.path.exists(audio_file):
+                # Get file size
+                file_size = os.path.getsize(audio_file) / (1024 * 1024)  # Convert to MB
+                
+                if file_size > 50:  # Telegram limit is 50MB for bots
+                    await event.reply(f"❌ File too large ({file_size:.1f}MB). Max size is 50MB.")
+                    os.remove(audio_file)
+                    return
+                
+                # Send the audio file
+                await event.reply(f"✅ Download complete! Sending audio file ({file_size:.1f}MB)...")
+                
+                # Send as audio
+                await self.client.send_file(
+                    chat_id,
+                    audio_file,
+                    caption=f"🎵 {info.get('title', 'Unknown')}\nDuration: {info.get('duration', 0) // 60}:{info.get('duration', 0) % 60:02d}",
+                    supports_streaming=True
+                )
+                
+                # Clean up file
+                os.remove(audio_file)
+                
+                logger.info(f"YouTube audio sent to chat {chat_id}: {info.get('title', 'Unknown')}")
+                
+            else:
                 await event.reply("❌ Failed to download audio!")
-                return
-            
-            # Join voice call and play
-            stream = self.InputStream(
-                self.InputAudioStream(audio_file),
-            )
-            await self.calls.join_group_call(chat_id, stream)
-            self.current_playing[chat_id] = audio_file
-            
-            title = info.get('title', 'Unknown')
-            await event.reply(f"🎶 Now playing: **{title}**")
-            
-            logger.info(f"Playing YouTube in chat {chat_id}: {title}")
-            
+                
         except Exception as e:
-            logger.error(f"YouTube play error: {e}")
+            logger.error(f"YouTube download error: {e}")
             traceback.print_exc()
-            await event.reply(f"❌ Error: {str(e)}")
+            error_msg = str(e)[:200]
+            await event.reply(f"❌ Download failed: {error_msg}")
+    
+    async def run(self):
+        """Run the bot"""
+        try:
+            if await self.initialize():
+                logger.info("Bot is running...")
+                await self.client.run_until_disconnected()
+        except Exception as e:
+            logger.error(f"Bot run error: {e}")
+            traceback.print_exc()
 
-# Flask routes for Render
+# Flask routes
 @app.route('/')
 def home():
+    bot_status = "running" if bot_instance and bot_instance.is_running else "not_running"
     return jsonify({
         "status": "online",
         "service": "Telegram Music Bot",
-        "endpoints": ["/", "/health", "/webhook"],
-        "special_users": SPECIAL_USERS
+        "bot_status": bot_status,
+        "special_users": SPECIAL_USERS,
+        "endpoints": ["/", "/health", "/webhook", "/keepalive"],
+        "features": [
+            "YouTube audio download",
+            "Media forwarding for special users",
+            "Group linking"
+        ]
     })
 
 @app.route('/health')
 def health():
-    bot_status = "initialized" if music_bot and music_bot.is_initialized else "not_initialized"
+    bot_status = "running" if bot_instance and bot_instance.is_running else "not_running"
     return jsonify({
         "status": "healthy",
         "bot": bot_status,
-        "python_version": sys.version
+        "python_version": sys.version.split()[0],
+        "timestamp": time.time()
     })
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    """Simple webhook endpoint (for future use)"""
     try:
         data = request.json
         logger.info(f"Webhook received: {data}")
-        return jsonify({"status": "received"})
+        
+        # You can process webhook data here
+        # For now, just acknowledge receipt
+        
+        return jsonify({
+            "status": "received",
+            "message": "Webhook processed",
+            "timestamp": time.time()
+        })
     except Exception as e:
         logger.error(f"Webhook error: {e}")
         return jsonify({"error": str(e)}), 400
@@ -361,38 +328,45 @@ def webhook():
 @app.route('/keepalive')
 def keepalive():
     """Endpoint to keep Render instance alive"""
-    return jsonify({"status": "alive", "timestamp": asyncio.get_event_loop().time()})
+    return jsonify({
+        "status": "alive",
+        "timestamp": time.time(),
+        "url": RENDER_WEB_URL
+    })
 
-def run_bot():
-    """Run the Telegram bot"""
-    global music_bot
+def run_bot_in_thread():
+    """Run the Telegram bot in a separate thread"""
+    global bot_instance, bot_loop
+    
     try:
-        music_bot = MusicBot()
-        
         # Create a new event loop for this thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        bot_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(bot_loop)
         
-        # Run the bot
-        loop.run_until_complete(music_bot.start())
+        # Create and run bot
+        bot_instance = TelegramBot()
+        bot_loop.run_until_complete(bot_instance.run())
         
     except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
+        logger.error(f"Bot thread error: {e}")
         traceback.print_exc()
 
-def run_flask():
-    """Run Flask server"""
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+def start_bot():
+    """Start the bot in a daemon thread"""
+    bot_thread = threading.Thread(target=run_bot_in_thread, daemon=True)
+    bot_thread.start()
+    logger.info("Bot thread started")
+    return bot_thread
 
 def main():
     """Main function to start both Flask and bot"""
-    # Start bot in a separate thread
-    bot_thread = Thread(target=run_bot, daemon=True)
-    bot_thread.start()
+    # Start the bot
+    start_bot()
     
-    # Start Flask in main thread
-    run_flask()
+    # Start Flask
+    port = int(os.environ.get('PORT', 10000))
+    logger.info(f"Starting Flask on port {port}")
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
     main()
