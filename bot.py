@@ -6,6 +6,7 @@ import threading
 import re
 import json
 import time
+import traceback
 from flask import Flask, jsonify
 from telethon import TelegramClient, events, functions, types
 import yt_dlp
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 
 # User account (joins voice chats and plays music) - NEEDS API ID/HASH
-USER_API_ID = int(os.getenv('USER_API_ID', ''))
+USER_API_ID = os.getenv('USER_API_ID', '')
 USER_API_HASH = os.getenv('USER_API_HASH', '')
 USER_PHONE = os.getenv('USER_PHONE', '')  # Optional: phone number for login
 
@@ -44,15 +45,21 @@ class VoiceChatMusicBot:
         try:
             logger.info("Initializing BOT account (using Bot Token)...")
             # Initialize BOT account using ONLY BOT_TOKEN
-            # Telethon will automatically use the bot's API ID/HASH internally
-            self.bot_client = TelegramClient('bot_session', 2040, "b18441a1ff500e" ) # Telegram's bot API credentials
+            # We use Telegram's default bot API credentials
+            self.bot_client = TelegramClient('bot_session', 2040, "b18441a1ff500e14f25e2e95ffd20eeb")
             await self.bot_client.start(bot_token=BOT_TOKEN)
             bot_me = await self.bot_client.get_me()
             logger.info(f"✅ BOT account started: @{bot_me.username} (ID: {bot_me.id})")
             
             logger.info("Initializing USER account (using API ID/HASH)...")
             # Initialize USER account using USER'S OWN API ID/HASH
-            self.user_client = TelegramClient('user_session', USER_API_ID, USER_API_HASH)
+            # Convert USER_API_ID to integer
+            if not USER_API_ID or not USER_API_HASH:
+                logger.error("❌ USER_API_ID or USER_API_HASH is not set")
+                return False
+                
+            user_api_id_int = int(USER_API_ID)
+            self.user_client = TelegramClient('user_session', user_api_id_int, USER_API_HASH)
             
             # Start user client
             if USER_PHONE:
@@ -75,6 +82,7 @@ class VoiceChatMusicBot:
             
         except Exception as e:
             logger.error(f"❌ Initialization failed: {e}")
+            traceback.print_exc()
             return False
     
     def setup_handlers(self):
@@ -125,6 +133,7 @@ class VoiceChatMusicBot:
                 
             except Exception as e:
                 logger.error(f"Play error: {e}")
+                traceback.print_exc()
                 await event.reply(f"❌ Error: {str(e)[:150]}")
         
         @self.bot_client.on(events.NewMessage(pattern='/stopmusic'))
@@ -146,9 +155,19 @@ class VoiceChatMusicBot:
             else:
                 await event.reply("❌ No active voice chat in this group")
         
+        @self.bot_client.on(events.NewMessage(pattern='/pause'))
+        async def pause_handler(event):
+            if event.sender_id in OWNERS:
+                await event.reply("⏸️ Pause command received (feature coming soon)")
+        
+        @self.bot_client.on(events.NewMessage(pattern='/resume'))
+        async def resume_handler(event):
+            if event.sender_id in OWNERS:
+                await event.reply("▶️ Resume command received (feature coming soon)")
+        
         @self.bot_client.on(events.NewMessage(pattern='/help'))
         async def help_handler(event):
-            help_text = """
+            help_text = f"""
             **🎵 Voice Chat Music Bot Help 🎵**
             
             **How it works:**
@@ -160,21 +179,24 @@ class VoiceChatMusicBot:
             • `/play [youtube_url]` - Play in current group
             • Forward video, reply with `/play @GroupUsername`
             • `/stopmusic` - Stop and leave VC
+            • `/pause` - Pause music (coming soon)
+            • `/resume` - Resume music (coming soon)
             
             **Requirements:**
             • Bot must be admin in group
             • USER ACCOUNT must be added to group
             • Voice chat must be active
             
-            **Owners only:** {owners}
-            """.format(owners=', '.join(map(str, OWNERS)))
+            **Owners only:** {', '.join(map(str, OWNERS))}
+            """
             
             await event.reply(help_text)
         
         @self.bot_client.on(events.NewMessage(incoming=True))
         async def message_handler(event):
-            """Handle forwarded media from owners"""
+            """Handle all incoming messages"""
             try:
+                # Handle forwarded media from owners in private chat
                 if event.sender_id in OWNERS and event.is_private:
                     if event.video or event.document:
                         await event.reply(
@@ -208,6 +230,7 @@ class VoiceChatMusicBot:
             
         except Exception as e:
             logger.error(f"Forwarded media error: {e}")
+            traceback.print_exc()
             await event.reply(f"❌ Error: {str(e)[:150]}")
     
     async def play_in_current_group(self, event, youtube_url):
@@ -253,7 +276,7 @@ class VoiceChatMusicBot:
                 f"Use `/stopmusic` to stop"
             )
             
-            # Send audio file (for now)
+            # Send audio file
             await self.bot_client.send_file(
                 chat_id,
                 audio_file,
@@ -266,6 +289,7 @@ class VoiceChatMusicBot:
             
         except Exception as e:
             logger.error(f"Play error: {e}")
+            traceback.print_exc()
             await event.reply(f"❌ Error: {str(e)[:150]}")
     
     async def play_forwarded_in_group(self, event, media_msg, target_group):
@@ -335,6 +359,7 @@ class VoiceChatMusicBot:
             
         except Exception as e:
             logger.error(f"Forwarded play error: {e}")
+            traceback.print_exc()
             await event.reply(f"❌ Error: {str(e)[:150]}")
     
     async def get_group_call(self, chat_id):
@@ -373,6 +398,7 @@ class VoiceChatMusicBot:
             
         except Exception as e:
             logger.error(f"Join voice chat error: {e}")
+            traceback.print_exc()
             return None
     
     async def download_youtube(self, url):
@@ -394,7 +420,15 @@ class VoiceChatMusicBot:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
-                return os.path.splitext(filename)[0] + '.mp3'
+                audio_file = os.path.splitext(filename)[0] + '.mp3'
+                
+                # Check if file exists
+                if os.path.exists(audio_file):
+                    return audio_file
+                elif os.path.exists(filename):
+                    return filename
+                else:
+                    return None
                 
         except Exception as e:
             logger.error(f"YouTube download error: {e}")
@@ -432,12 +466,14 @@ class VoiceChatMusicBot:
         try:
             if await self.initialize():
                 logger.info("🎵 Bot system running! Waiting for commands...")
+                # Run both clients
                 await asyncio.gather(
                     self.bot_client.run_until_disconnected(),
                     self.user_client.run_until_disconnected()
                 )
         except Exception as e:
             logger.error(f"Run error: {e}")
+            traceback.print_exc()
 
 # ================= FLASK ROUTES =================
 @app.route('/')
