@@ -4,23 +4,24 @@ import threading
 from flask import Flask
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
-from pytgcalls import PyTgCalls, StreamType
-from pytgcalls.types.input_stream import AudioVideoPiped
-from pytgcalls.exceptions import NoActiveGroupCall, GroupCallNotFound
+from pytgcalls import PyTgCalls
 import yt_dlp
 
-app = Flask(__name__)
+app_flask = Flask(__name__)
 
-@app.route('/')
+@app_flask.route('/')
 def home():
-    return "Bot is alive!"
+    return "Music Bot is running!"
 
+# Environment variables from Render
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 STRING_SESSION = os.environ.get("STRING_SESSION")
-OWNERS = [int(x) for x in os.environ.get("OWNER_IDS", "8508010746 7450951468 8255234078").split()]
+OWNER_IDS_STR = os.environ.get("OWNER_IDS", "8508010746 7450951468 8255234078")
+OWNERS = [int(uid) for uid in OWNER_IDS_STR.split()]
 
+# Clients
 bot = Client(
     "music_bot",
     api_id=API_ID,
@@ -35,128 +36,129 @@ user = Client(
     session_string=STRING_SESSION
 )
 
-calls = PyTgCalls(user)
-
-async def join_or_start_call(chat_id: int):
-    try:
-        await calls.join_group_call(
-            chat_id,
-            AudioVideoPiped("silent.mp3"),  # Use silent file to join/start
-            stream_type=StreamType().pulsed_stream
-        )
-    except NoActiveGroupCall:
-        await user.create_group_call(chat_id)
-        await calls.join_group_call(
-            chat_id,
-            AudioVideoPiped("silent.mp3"),
-            stream_type=StreamType().pulsed_stream
-        )
-    except Exception as e:
-        raise e
+# PyTgCalls instance (attached to user/client)
+pytgcalls = PyTgCalls(user)
 
 @bot.on_message(filters.private & filters.user(OWNERS) & filters.command("play"))
-async def play_cmd(client: Client, message: Message):
+async def play_cmd(_, message: Message):
     if not message.reply_to_message:
-        await message.reply("Reply to a YouTube link or video message.")
+        await message.reply_text("Please reply to a YouTube link message or a video/document message.")
         return
+
     if len(message.command) < 2:
-        await message.reply("Usage: /play <group_link_or_id>")
+        await message.reply_text("Usage: /play <group_link_or_chat_id>\nExample: /play https://t.me/+abc123 or /play -1001234567890")
         return
 
     replied = message.reply_to_message
-    group = message.command[1]
-    url = None
-    local_file = None
+    group_input = message.command[1].strip()
 
-    if replied.text and ("youtube.com" in replied.text or "youtu.be" in replied.text):
-        url = replied.text
-    elif replied.video or replied.document:
-        local_file = await replied.download()
-        url = local_file  # Stream local file
-    else:
-        await message.reply("Not a valid YouTube link or video.")
-        return
-
+    # Resolve and join group
     try:
-        if group.startswith("https://t.me/"):
-            group_name = group.split("/")[-1]
-            chat = await user.join_chat(group)  # Joins using link (public or invite)
+        if group_input.startswith("https://t.me/"):
+            chat = await user.join_chat(group_input)
         else:
-            chat = await user.get_chat(int(group))
+            chat_id_int = int(group_input)
+            chat = await user.get_chat(chat_id_int)
         chat_id = chat.id
     except Exception as e:
-        await message.reply(f"Failed to join/resolve group: {e}")
+        await message.reply_text(f"Failed to resolve/join group: {str(e)}\nMake sure the link/ID is correct and bot can join.")
         return
 
-    try:
-        if "youtube.com" in url or "youtu.be" in url:
+    # Get media source
+    source = None
+    local_path = None
+    is_local = False
+
+    if replied.text and ("youtube.com" in replied.text or "youtu.be" in replied.text):
+        source = replied.text.strip()
+    elif replied.video or replied.document:
+        local_path = await replied.download()
+        source = local_path
+        is_local = True
+    else:
+        await message.reply_text("Reply to a valid YouTube URL (text) or video/document file.")
+        return
+
+    # For YouTube → extract direct stream URL
+    if not is_local:
+        try:
             ydl_opts = {
-                'format': 'bestvideo+bestaudio/best',
+                'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
                 'quiet': True,
                 'no_warnings': True,
-                'prefer_ffmpeg': True,
+                'noplaylist': True,
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                url = info['url']  # Direct stream URL
+                info = ydl.extract_info(source, download=False)
+                source = info['url']  # direct playable URL
+        except Exception as e:
+            await message.reply_text(f"YouTube extraction failed: {str(e)}")
+            if local_path and os.path.exists(local_path):
+                os.remove(local_path)
+            return
 
-        await join_or_start_call(chat_id)
-        await calls.change_stream(
-            chat_id,
-            AudioVideoPiped(url)
+    try:
+        # Start playing (pytgcalls handles join/start call if needed)
+        await pytgcalls.play(chat_id, source)
+        await message.reply_text(
+            f"Started playing in group **{chat.title or chat_id}** ({chat_id}).\n"
+            f"Ensure the assistant account is **admin** with **Manage Voice Chats** permission."
         )
-        await message.reply(f"Playing in group {chat_id}. Promote assistant to admin if needed.")
     except Exception as e:
-        await message.reply(f"Error playing: {e}")
+        await message.reply_text(f"Failed to play: {str(e)}\nCheck if VC is allowed and assistant rights.")
     finally:
-        if local_file:
-            os.remove(local_file)
+        if local_path and os.path.exists(local_path):
+            os.remove(local_path)
 
 @bot.on_message(filters.private & filters.user(OWNERS) & filters.command("pause"))
-async def pause_cmd(client: Client, message: Message):
+async def pause_cmd(_, message: Message):
     if len(message.command) < 2:
-        await message.reply("Usage: /pause <group_id>")
+        await message.reply_text("Usage: /pause <group_chat_id>")
         return
-    chat_id = int(message.command[1])
     try:
-        await calls.pause_stream(chat_id)
-        await message.reply("Paused.")
+        chat_id = int(message.command[1])
+        await pytgcalls.pause(chat_id)
+        await message.reply_text("Paused.")
     except Exception as e:
-        await message.reply(f"Error: {e}")
+        await message.reply_text(f"Error: {str(e)}")
 
 @bot.on_message(filters.private & filters.user(OWNERS) & filters.command("resume"))
-async def resume_cmd(client: Client, message: Message):
+async def resume_cmd(_, message: Message):
     if len(message.command) < 2:
-        await message.reply("Usage: /resume <group_id>")
+        await message.reply_text("Usage: /resume <group_chat_id>")
         return
-    chat_id = int(message.command[1])
     try:
-        await calls.resume_stream(chat_id)
-        await message.reply("Resumed.")
+        chat_id = int(message.command[1])
+        await pytgcalls.resume(chat_id)
+        await message.reply_text("Resumed.")
     except Exception as e:
-        await message.reply(f"Error: {e}")
+        await message.reply_text(f"Error: {str(e)}")
 
 @bot.on_message(filters.private & filters.user(OWNERS) & filters.command("stopmusic"))
-async def stop_cmd(client: Client, message: Message):
+async def stop_cmd(_, message: Message):
     if len(message.command) < 2:
-        await message.reply("Usage: /stopmusic <group_id>")
+        await message.reply_text("Usage: /stopmusic <group_chat_id>")
         return
-    chat_id = int(message.command[1])
     try:
-        await calls.leave_group_call(chat_id)
-        await message.reply("Stopped.")
+        chat_id = int(message.command[1])
+        await pytgcalls.stop(chat_id)
+        await message.reply_text("Stopped and left VC.")
     except Exception as e:
-        await message.reply(f"Error: {e}")
+        await message.reply_text(f"Error: {str(e)}")
 
-def run_bot():
+def run_telegram():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     bot.start()
     user.start()
-    calls.start()
+    pytgcalls.start()
+    print("Telegram clients and pytgcalls started!")
     idle()
 
 if __name__ == "__main__":
-    threading.Thread(target=run_bot).start()
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    # Run Telegram bot in background thread
+    threading.Thread(target=run_telegram, daemon=True).start()
+
+    # Flask server for Render web keep-alive
+    port = int(os.environ.get("PORT", 10000))
+    app_flask.run(host="0.0.0.0", port=port)

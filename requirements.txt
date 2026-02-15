@@ -2,6 +2,6 @@ flask
 requests
 pyrogram
 tgcrypto
-pytgcalls
+git+https://github.com/pytgcalls/pytgcalls.git
 yt-dlp
 ffmpeg-python
