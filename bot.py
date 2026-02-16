@@ -4,7 +4,7 @@ import threading
 from flask import Flask
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
-from pytgcalls import PyTgCalls
+from py_tgcalls import PyTgCalls
 import yt_dlp
 
 app_flask = Flask(__name__)

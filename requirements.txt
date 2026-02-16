@@ -2,6 +2,6 @@ flask
 requests
 pyrogram==2.0.106
 tgcrypto
-pytgcalls==3.0.0.dev8   # or latest dev that matches 2.0.106
+py-tgcalls
 yt-dlp
 ffmpeg-python
