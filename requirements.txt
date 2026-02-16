@@ -1,7 +1,7 @@
 flask
 requests
-git+https://github.com/pyrogram/pyrogram.git
+pyrogram==2.0.106
 tgcrypto
-git+https://github.com/pytgcalls/pytgcalls.git
+pytgcalls==3.0.0.dev8   # or latest dev that matches 2.0.106
 yt-dlp
 ffmpeg-python
