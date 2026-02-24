@@ -1,7 +1,5 @@
 flask
-requests
-pyrogram==2.0.106
-tgcrypto
-py-tgcalls
+pyrogram
+pytgcalls
 yt-dlp
-ffmpeg-python
+TgCrypto
