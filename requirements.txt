@@ -1,5 +1,6 @@
 flask
+requests
 pyrogram
-pytgcalls
+tgcrypto
+py-tgcalls
 yt-dlp
-TgCrypto

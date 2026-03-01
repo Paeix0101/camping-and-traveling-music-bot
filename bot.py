@@ -1,125 +1,175 @@
 import os
+import re
 import asyncio
-import tempfile
-from threading import Thread
+import threading
 from flask import Flask
-
-from pyrogram import Client, filters
+from pyrogram import Client
+from pyrogram.errors import UserNotParticipant
 from pyrogram.types import Message
-
-from pytgcalls import PyTgCalls
-from pytgcalls.types.input_stream import AudioPiped, VideoPiped
+from pyrogram import filters
+from py_tgcalls import PyTgCalls, idle
+from py_tgcalls.types import AudioVideoPiped, HighQualityAudio, HighQualityVideo
 import yt_dlp
-
-# ============== CONFIG ==============
-OWNER_IDS = [8508010746, 7450951468, 8255234078]
-
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")   # generate with the code below
-# ====================================
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Music Bot is alive on Render!"
+    return "Bot is alive!"
 
 def run_flask():
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
 
-# Pyrogram + PyTgCalls
-client = Client(
-    "musicbot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING
-)
-call = PyTgCalls(client)
+threading.Thread(target=run_flask, daemon=True).start()
 
-last_video_path = {}   # user_id : local file path
+api_id = int(os.environ['API_ID'])
+api_hash = os.environ['API_HASH']
+bot_token = os.environ['BOT_TOKEN']
+user_session = os.environ['USER_SESSION']
+owners = [8508010746, 7450951468, 8255234078]
 
-async def play_in_group(chat_id: int, source: str, is_video: bool = True):
-    try:
-        # Stop previous stream if any
-        try:
-            await call.leave_group_call(chat_id)
-        except:
-            pass
+os.makedirs('downloads', exist_ok=True)
 
-        if "youtube.com" in source or "youtu.be" in source:
-            # Get direct stream URL
-            ydl_opts = {
-                "format": "bestvideo+bestaudio/best" if is_video else "bestaudio",
-                "quiet": True,
-                "no_warnings": True
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(source, download=False)
-                stream_url = info["url"]
-
-            stream = VideoPiped(stream_url) if is_video else AudioPiped(stream_url)
-        else:
-            # local video file
-            stream = VideoPiped(source) if is_video else AudioPiped(source)
-
-        await call.join_group_call(chat_id, stream)
-        print(f"Started playing in {chat_id}")
-    except Exception as e:
-        print(f"Play error: {e}")
-
-@client.on_message(filters.command("play") & filters.user(OWNER_IDS))
-async def on_play(client: Client, message: Message):
-    if message.chat.type == "private":
-        # Private: reply to a video with /play <group_id>
-        if not message.reply_to_message or not message.reply_to_message.video:
-            await message.reply("Reply to a video message with /play <group_id>")
-            return
-        if len(message.command) < 2:
-            await message.reply("Usage: reply to video + /play <group_id>")
-            return
-
-        group_id = int(message.command[1])
-        video_msg = message.reply_to_message.video
-
-        # Download video
-        path = await client.download_media(video_msg, file_name=f"video_{message.from_user.id}.mp4")
-        last_video_path[message.from_user.id] = path
-
-        await play_in_group(group_id, path, is_video=True)
-        await message.reply(f"✅ Playing your video in group {group_id} (as video stream)")
-
-    else:
-        # Group: /play <youtube link>
-        if len(message.command) < 2:
-            await message.reply("Usage: /play <youtube video link>")
-            return
-        yt_link = message.command[1]
-        await play_in_group(message.chat.id, yt_link, is_video=True)
-        await message.reply("✅ Joining VC and playing YouTube video (as video stream)")
-
-@client.on_message(filters.command("stopmusic") & filters.user(OWNER_IDS))
-async def on_stop(client: Client, message: Message):
-    if message.chat.type != "private":
-        try:
-            await call.leave_group_call(message.chat.id)
-            await message.reply("⏹ Stopped music and left VC")
-        except:
-            await message.reply("Not playing anything here")
-    else:
-        await message.reply("Send /stopmusic in the group")
-
-@client.on_message(filters.video & filters.private & filters.user(OWNER_IDS))
-async def save_video(client: Client, message: Message):
-    await message.reply("Video received. Reply to it with /play <group_id> to play in that group.")
+bot = Client("music_bot", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
+user = Client("music_user", api_id=api_id, api_hash=api_hash, session_string=user_session)
+calls = PyTgCalls(user)
 
 async def main():
-    await call.start()
-    await client.start()
-    print("✅ Music Bot Started (owners only)")
-    await asyncio.Event().wait()   # keep alive (idle)
+    await bot.start()
+    await user.start()
+    await calls.start()
+    print("Bot started")
+    await idle()
 
-if __name__ == "__main__":
-    Thread(target=run_flask, daemon=True).start()
-    asyncio.run(main())
+def download_youtube(url):
+    ydl_opts = {
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'outtmpl': 'downloads/%(id)s.%(ext)s',
+        'noplaylist': True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        return ydl.prepare_filename(info)
+
+async def get_chat_id(identifier: str) -> int:
+    if identifier.isdigit() or identifier.startswith('-'):
+        return int(identifier)
+    elif identifier.startswith('@'):
+        username = identifier[1:]
+    elif identifier.startswith('https://t.me/'):
+        parts = identifier.split('/')
+        if len(parts) >= 4:
+            username = parts[3]
+        else:
+            raise ValueError("Invalid link")
+    else:
+        raise ValueError("Invalid group identifier")
+    chat = await bot.get_chat(username)
+    return chat.id
+
+async def ensure_user_in_group(chat_id, message):
+    user_me = await user.get_me()
+    try:
+        await user.get_chat_member(chat_id, user_me.id)
+    except UserNotParticipant:
+        try:
+            await bot.add_chat_members(chat_id, user_me.id)
+        except:
+            await message.reply("Can't add user to group. Make bot admin with 'add members' rights or add user manually.")
+            return False
+    return True
+
+@bot.on_message(filters.group & filters.command("play"))
+async def play_in_group(client: Client, message: Message):
+    if len(message.command) < 2:
+        await message.reply("Usage: /play <youtube url>")
+        return
+    url = ' '.join(message.command[1:])
+    if 'youtube.com' not in url and 'youtu.be' not in url:
+        await message.reply("Only YouTube links supported in groups.")
+        return
+    try:
+        file = download_youtube(url)
+    except Exception as e:
+        await message.reply(f"Error downloading: {str(e)}")
+        return
+    chat_id = message.chat.id
+    if not await ensure_user_in_group(chat_id, message):
+        return
+    try:
+        await calls.join_group_call(
+            chat_id,
+            AudioVideoPiped(file, audio_parameters=HighQualityAudio(), video_parameters=HighQualityVideo())
+        )
+        await message.reply("Playing.")
+    except Exception as e:
+        await message.reply(f"Error playing: {str(e)}")
+
+@bot.on_message(filters.group & filters.command("stopmusic"))
+async def stop_in_group(client: Client, message: Message):
+    chat_id = message.chat.id
+    try:
+        await calls.leave_group_call(chat_id)
+        await message.reply("Stopped.")
+    except:
+        await message.reply("Not playing.")
+
+@bot.on_message(filters.private & filters.user(owners) & filters.regex(r"^/play\(.+\)$") & filters.reply)
+async def play_private(client: Client, message: Message):
+    match = re.match(r"^/play\((.+)\)$", message.text)
+    if not match:
+        await message.reply("Format: reply with /play(group_identifier)")
+        return
+    group_str = match.group(1)
+    try:
+        chat_id = await get_chat_id(group_str)
+    except Exception as e:
+        await message.reply(f"Invalid group: {str(e)}")
+        return
+    replied = message.reply_to_message
+    file = None
+    if replied.video or (replied.document and replied.document.mime_type.startswith('video/')):
+        file = await replied.download('downloads/')
+    elif replied.text:
+        urls = re.findall(r'(https?://[^\s]+)', replied.text)
+        for url in urls:
+            if 'youtube.com' in url or 'youtu.be' in url:
+                try:
+                    file = download_youtube(url)
+                    break
+                except:
+                    pass
+    if not file:
+        await message.reply("Replied message must contain a video file or YouTube link.")
+        return
+    if not await ensure_user_in_group(chat_id, message):
+        return
+    try:
+        await calls.join_group_call(
+            chat_id,
+            AudioVideoPiped(file, audio_parameters=HighQualityAudio(), video_parameters=HighQualityVideo())
+        )
+        await message.reply("Playing in group.")
+    except Exception as e:
+        await message.reply(f"Error: {str(e)}")
+
+@bot.on_message(filters.private & filters.user(owners) & filters.regex(r"^/stopmusic\(.+\)$"))
+async def stop_private(client: Client, message: Message):
+    match = re.match(r"^/stopmusic\((.+)\)$", message.text)
+    if not match:
+        await message.reply("Format: /stopmusic(group_identifier)")
+        return
+    group_str = match.group(1)
+    try:
+        chat_id = await get_chat_id(group_str)
+    except Exception as e:
+        await message.reply(f"Invalid group: {str(e)}")
+        return
+    try:
+        await calls.leave_group_call(chat_id)
+        await message.reply("Stopped.")
+    except:
+        await message.reply("Not playing.")
+
+asyncio.run(main())
