@@ -2,11 +2,12 @@ import os
 import re
 import asyncio
 import threading
+import subprocess
+import sys
 from flask import Flask
-from pyrogram import Client
-from pyrogram.errors import UserNotParticipant
+from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram import filters
+from pyrogram.errors import UserNotParticipant
 from py_tgcalls import PyTgCalls, idle
 from py_tgcalls.types import AudioVideoPiped, HighQualityAudio, HighQualityVideo
 import yt_dlp
@@ -15,14 +16,15 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is alive!"
+    return "Music Bot is alive! 🚀"
 
 def run_flask():
     port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 threading.Thread(target=run_flask, daemon=True).start()
 
+# Environment variables
 api_id = int(os.environ['API_ID'])
 api_hash = os.environ['API_HASH']
 bot_token = os.environ['BOT_TOKEN']
@@ -35,141 +37,172 @@ bot = Client("music_bot", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
 user = Client("music_user", api_id=api_id, api_hash=api_hash, session_string=user_session)
 calls = PyTgCalls(user)
 
+# Debug: Print versions on startup
+print("Python version:", sys.version.splitlines()[0])
+print("FFmpeg version:", subprocess.getoutput('ffmpeg -version').splitlines()[0])
+print("py-tgcalls version:", PyTgCalls.__version__ if hasattr(PyTgCalls, '__version__') else "unknown")
+
 async def main():
     await bot.start()
     await user.start()
     await calls.start()
-    print("Bot started")
+    print("Bot & User client started successfully")
     await idle()
 
-def download_youtube(url):
+def download_youtube(url: str) -> str:
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': 'downloads/%(id)s.%(ext)s',
         'noplaylist': True,
+        'quiet': True,
+        'no_warnings': True,
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        return ydl.prepare_filename(info)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            return ydl.prepare_filename(info)
+    except Exception as e:
+        raise Exception(f"YouTube download failed: {str(e)}")
 
 async def get_chat_id(identifier: str) -> int:
-    if identifier.isdigit() or identifier.startswith('-'):
+    identifier = identifier.strip()
+    if identifier.isdigit() or (identifier.startswith('-') and identifier[1:].isdigit()):
         return int(identifier)
-    elif identifier.startswith('@'):
+    if identifier.startswith('@'):
         username = identifier[1:]
-    elif identifier.startswith('https://t.me/'):
+    elif 't.me/' in identifier:
         parts = identifier.split('/')
-        if len(parts) >= 4:
-            username = parts[3]
+        username = next((p for p in parts if p.startswith('@') or not p.startswith('http')), None)
+        if username and username.startswith('@'):
+            username = username[1:]
         else:
-            raise ValueError("Invalid link")
+            raise ValueError("Invalid Telegram link")
     else:
-        raise ValueError("Invalid group identifier")
+        raise ValueError("Invalid group identifier. Use @username, https://t.me/... or -100xxxxxxxxxx")
+    
     chat = await bot.get_chat(username)
     return chat.id
 
-async def ensure_user_in_group(chat_id, message):
-    user_me = await user.get_me()
+async def ensure_user_in_group(chat_id: int, message: Message) -> bool:
     try:
-        await user.get_chat_member(chat_id, user_me.id)
+        me = await user.get_me()
+        await user.get_chat_member(chat_id, me.id)
+        return True
     except UserNotParticipant:
         try:
-            await bot.add_chat_members(chat_id, user_me.id)
-        except:
-            await message.reply("Can't add user to group. Make bot admin with 'add members' rights or add user manually.")
+            await bot.add_chat_members(chat_id, (await user.get_me()).id)
+            await message.reply("Added assistant user to the group voice chat.")
+            return True
+        except Exception as e:
+            await message.reply(f"Failed to add assistant to group: {str(e)}\nMake sure bot is admin with 'Add Members' permission.")
             return False
-    return True
+    except Exception as e:
+        await message.reply(f"Error checking group membership: {str(e)}")
+        return False
+
+# ────────────────────────────────────────────────
+# Group commands
+# ────────────────────────────────────────────────
 
 @bot.on_message(filters.group & filters.command("play"))
-async def play_in_group(client: Client, message: Message):
+async def play_in_group(_, message: Message):
     if len(message.command) < 2:
-        await message.reply("Usage: /play <youtube url>")
-        return
-    url = ' '.join(message.command[1:])
-    if 'youtube.com' not in url and 'youtu.be' not in url:
-        await message.reply("Only YouTube links supported in groups.")
-        return
+        return await message.reply("Usage: /play <youtube_url>")
+    
+    url = ' '.join(message.command[1:]).strip()
+    if not ("youtube.com" in url or "youtu.be" in url):
+        return await message.reply("Only YouTube links are supported in groups right now.")
+    
     try:
-        file = download_youtube(url)
+        file_path = download_youtube(url)
     except Exception as e:
-        await message.reply(f"Error downloading: {str(e)}")
+        return await message.reply(f"Download failed: {str(e)}")
+    
+    if not await ensure_user_in_group(message.chat.id, message):
         return
-    chat_id = message.chat.id
-    if not await ensure_user_in_group(chat_id, message):
-        return
+    
     try:
         await calls.join_group_call(
-            chat_id,
-            AudioVideoPiped(file, audio_parameters=HighQualityAudio(), video_parameters=HighQualityVideo())
+            message.chat.id,
+            AudioVideoPiped(
+                file_path,
+                audio_parameters=HighQualityAudio(),
+                video_parameters=HighQualityVideo()
+            )
         )
-        await message.reply("Playing.")
+        await message.reply("▶️ Started playing in voice chat.")
     except Exception as e:
-        await message.reply(f"Error playing: {str(e)}")
+        await message.reply(f"Play error: {str(e)}")
 
 @bot.on_message(filters.group & filters.command("stopmusic"))
-async def stop_in_group(client: Client, message: Message):
-    chat_id = message.chat.id
+async def stop_in_group(_, message: Message):
     try:
-        await calls.leave_group_call(chat_id)
-        await message.reply("Stopped.")
+        await calls.leave_group_call(message.chat.id)
+        await message.reply("⏹️ Stopped playing.")
     except:
-        await message.reply("Not playing.")
+        await message.reply("Nothing was playing.")
+
+# ────────────────────────────────────────────────
+# Private owner commands (reply-based)
+# ────────────────────────────────────────────────
 
 @bot.on_message(filters.private & filters.user(owners) & filters.regex(r"^/play\(.+\)$") & filters.reply)
-async def play_private(client: Client, message: Message):
-    match = re.match(r"^/play\((.+)\)$", message.text)
+async def play_private(_, message: Message):
+    match = re.match(r"^/play\((.+)\)$", message.text.strip())
     if not match:
-        await message.reply("Format: reply with /play(group_identifier)")
-        return
-    group_str = match.group(1)
+        return await message.reply("Reply to video/link with: /play(@group or -100xxxxxx)")
+    
+    group_str = match.group(1).strip()
     try:
         chat_id = await get_chat_id(group_str)
     except Exception as e:
-        await message.reply(f"Invalid group: {str(e)}")
-        return
+        return await message.reply(f"Invalid group: {str(e)}")
+    
     replied = message.reply_to_message
-    file = None
-    if replied.video or (replied.document and replied.document.mime_type.startswith('video/')):
-        file = await replied.download('downloads/')
+    file_path = None
+    
+    if replied.video or (replied.document and 'video' in replied.document.mime_type):
+        file_path = await replied.download(file_name="downloads/")
     elif replied.text:
-        urls = re.findall(r'(https?://[^\s]+)', replied.text)
-        for url in urls:
-            if 'youtube.com' in url or 'youtu.be' in url:
-                try:
-                    file = download_youtube(url)
-                    break
-                except:
-                    pass
-    if not file:
-        await message.reply("Replied message must contain a video file or YouTube link.")
-        return
+        urls = re.findall(r'(https?://[^\s]+(?:youtube\.com|youtu\.be)[^\s]*)', replied.text)
+        if urls:
+            try:
+                file_path = download_youtube(urls[0])
+            except Exception as e:
+                return await message.reply(f"YouTube download failed: {str(e)}")
+    
+    if not file_path:
+        return await message.reply("Reply to a video file or message containing YouTube link.")
+    
     if not await ensure_user_in_group(chat_id, message):
         return
+    
     try:
         await calls.join_group_call(
             chat_id,
-            AudioVideoPiped(file, audio_parameters=HighQualityAudio(), video_parameters=HighQualityVideo())
+            AudioVideoPiped(
+                file_path,
+                audio_parameters=HighQualityAudio(),
+                video_parameters=HighQualityVideo()
+            )
         )
-        await message.reply("Playing in group.")
+        await message.reply(f"▶️ Playing in group {group_str}")
+    except Exception as e:
+        await message.reply(f"Failed to play: {str(e)}")
+
+@bot.on_message(filters.private & filters.user(owners) & filters.regex(r"^/stopmusic\(.+\)$"))
+async def stop_private(_, message: Message):
+    match = re.match(r"^/stopmusic\((.+)\)$", message.text.strip())
+    if not match:
+        return await message.reply("Usage: /stopmusic(@group or -100xxxxxx)")
+    
+    group_str = match.group(1).strip()
+    try:
+        chat_id = await get_chat_id(group_str)
+        await calls.leave_group_call(chat_id)
+        await message.reply(f"⏹️ Stopped in {group_str}")
     except Exception as e:
         await message.reply(f"Error: {str(e)}")
 
-@bot.on_message(filters.private & filters.user(owners) & filters.regex(r"^/stopmusic\(.+\)$"))
-async def stop_private(client: Client, message: Message):
-    match = re.match(r"^/stopmusic\((.+)\)$", message.text)
-    if not match:
-        await message.reply("Format: /stopmusic(group_identifier)")
-        return
-    group_str = match.group(1)
-    try:
-        chat_id = await get_chat_id(group_str)
-    except Exception as e:
-        await message.reply(f"Invalid group: {str(e)}")
-        return
-    try:
-        await calls.leave_group_call(chat_id)
-        await message.reply("Stopped.")
-    except:
-        await message.reply("Not playing.")
-
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
